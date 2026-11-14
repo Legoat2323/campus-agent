@@ -56,9 +56,13 @@ vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=embeddi
 
 app = FastAPI(title="我的校园Agent")
 
-# 检索距离阈值：超过它的片段视为不相关，直接丢弃。
-# 实测库内问题最高 0.87、库外最低 1.18，取中间值。
-RELEVANCE_THRESHOLD = 1.0
+# 检索距离阈值：距离 >= 它的片段视为不相关，直接丢弃。
+# 2026-11-14 用 20 题重新标定（test_distance_probe.py）：
+#   A 组 12 题「含答案片段」距离 0.555 ~ 1.162，B 组 8 题「最相似片段」1.024 ~ 1.203。
+#   两个分布重叠 → 距离分不开「话题像不像」和「事实在不在」。
+#   取 1.05：A 组放行 9/12、B 组 0 题被误放行（靠 prompt 兜底 8/8），综合 17/20。
+#   放宽到 1.20 能救回 12/12，但 B 组会有一半题拿到「相近但不含答案」的上下文，飘到 5~8/8。
+MAX_DISTANCE = 1.05
 
 # ----------------------------------------------------------------------------
 # 会话记忆：SQLite
@@ -152,8 +156,8 @@ def get_school_context(question: str) -> str:
     """检索知识库，只返回相关度够高的片段。"""
     try:
         results = vectorstore.similarity_search_with_score(question, k=3)
-        useful = [doc for doc, score in results if score < RELEVANCE_THRESHOLD]
-        log.info("检索命中 %d/%d 条（阈值 %.1f）", len(useful), len(results), RELEVANCE_THRESHOLD)
+        useful = [doc for doc, score in results if score < MAX_DISTANCE]
+        log.info("检索命中 %d/%d 条（阈值 %.1f）", len(useful), len(results), MAX_DISTANCE)
         return "\n".join(doc.page_content for doc in useful)
     except Exception:
         log.exception("检索出错，按无资料处理")
