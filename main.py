@@ -63,6 +63,8 @@ app = FastAPI(title="我的校园Agent")
 #   取 1.05：A 组放行 9/12、B 组 0 题被误放行（靠 prompt 兜底 8/8），综合 17/20。
 #   放宽到 1.20 能救回 12/12，但 B 组会有一半题拿到「相近但不含答案」的上下文，飘到 5~8/8。
 MAX_DISTANCE = 1.05
+MODEL_NAME = "glm-4-flash"
+MODEL_TEMPERATURE = 0.2  # 固定温度，保证可复现（0.2 与招投标项目一致）
 
 # ----------------------------------------------------------------------------
 # 会话记忆：SQLite
@@ -223,7 +225,7 @@ async def chat(request: ChatRequest):
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="glm-4-flash", messages=messages, tools=tools, tool_choice="auto"
+                model=MODEL_NAME, messages=messages, temperature=MODEL_TEMPERATURE, tools=tools, tool_choice="auto"
             )
             response_message = response.choices[0].message
             final_answer = None
@@ -240,7 +242,7 @@ async def chat(request: ChatRequest):
                             "content": get_weather(args.get("city")),
                         })
                 second = client.chat.completions.create(
-                    model="glm-4-flash", messages=messages
+                    model=MODEL_NAME, messages=messages, temperature=MODEL_TEMPERATURE
                 )
                 final_answer = second.choices[0].message.content
             else:
@@ -293,7 +295,7 @@ async def chat_stream(request: ChatRequest):
             # 第一阶段：非流式，判断要不要调工具
             # （流式响应里拿不到完整的 tool_calls，所以必须先用非流式问一次）
             first = client.chat.completions.create(
-                model="glm-4-flash", messages=messages, tools=tools, tool_choice="auto"
+                model=MODEL_NAME, messages=messages, temperature=MODEL_TEMPERATURE, tools=tools, tool_choice="auto"
             )
             response_message = first.choices[0].message
 
@@ -316,7 +318,7 @@ async def chat_stream(request: ChatRequest):
 
             # 第二阶段：带上工具结果，开启流式
             stream = client.chat.completions.create(
-                model="glm-4-flash", messages=messages, stream=True
+                model=MODEL_NAME, messages=messages, temperature=MODEL_TEMPERATURE, stream=True
             )
             for chunk in stream:
                 delta = chunk.choices[0].delta.content
