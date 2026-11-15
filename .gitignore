@@ -14,3 +14,7 @@ __pycache__/
 .idea/
 
 memory.db
+
+# 评测产物（可随时重跑，不入库）
+e1_answers.json
+*.log
