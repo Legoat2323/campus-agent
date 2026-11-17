@@ -104,6 +104,20 @@ def init_db() -> None:
             )
             """
         )
+        # D3：一次请求一行，events 是一个 JSON 数组（检索/每轮模型/工具/答案）
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS traces (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                events     TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_traces_session ON traces(session_id, id)"
+        )
         conn.commit()
 
 
@@ -196,6 +210,36 @@ def delete_messages(ids: list[int]) -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.executemany("DELETE FROM messages WHERE id=?", [(i,) for i in ids])
         conn.commit()
+
+
+def save_trace(session_id: str, events: list[dict]) -> None:
+    """把一次请求的事件列表存下来。失败不影响响应（trace 是辅助，不是主流程）。"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            conn.execute(
+                "INSERT INTO traces (session_id, events) VALUES (?, ?)",
+                (session_id, json.dumps(events, ensure_ascii=False)),
+            )
+            conn.commit()
+    except Exception as e:
+        log.warning("trace 落库失败 session=%s err=%s", session_id, e)
+
+
+def get_traces(session_id: str, limit: int = 20) -> list[dict]:
+    """取某个 session 最近的 trace，按时间倒序（最新的在前）。"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        rows = conn.execute(
+            "SELECT id, created_at, events FROM traces WHERE session_id=? ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+    out = []
+    for tid, created_at, events in rows:
+        try:
+            parsed = json.loads(events)
+        except json.JSONDecodeError:
+            parsed = []
+        out.append({"trace_id": tid, "created_at": created_at, "events": parsed})
+    return out
 
 
 def maybe_compress(session_id: str) -> None:
@@ -324,13 +368,15 @@ TOOLS_REGISTRY = {
 MAX_TOOL_ROUNDS = 3
 
 
-def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS):
+def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS, trace=None):
     """跑一次 agent 循环。返回 (answer, used_tool, rounds)。
 
     answer 为 None 表示"到轮数上限还没收口"。
+    trace：可选的 list，传进来就往里追加事件（D3 用），不传就什么也不记。
     """
     used_tool = False  # 初始时先假设没用过工具
     for rnd in range(1, max_rounds + 1):
+        _t_llm = time.perf_counter()
         resp = client.chat.completions.create(
             model=MODEL_NAME,
             messages=model_messages,
@@ -339,6 +385,14 @@ def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS):
             tool_choice="auto",
         )
         msg = resp.choices[0].message
+
+        if trace is not None:
+            trace.append({
+                "kind": "llm",
+                "round": rnd,
+                "ms": round((time.perf_counter() - _t_llm) * 1000),
+                "tool_calls": len(msg.tool_calls or []),
+            })
 
         if not msg.tool_calls:
             return msg.content, used_tool, rnd     # 收口：模型不再要工具
@@ -352,6 +406,7 @@ def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS):
                 args = json.loads(tool_call.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
+            _t_tool = time.perf_counter()
             if handler is None:
                 content = f"未知工具：{name}"
             else:
@@ -360,6 +415,14 @@ def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS):
                 except Exception as e:             # 工具自己崩了，别让整个请求挂掉
                     log.warning("工具执行失败 tool=%s err=%s", name, e)
                     content = f"工具执行失败：{e}"
+            if trace is not None:
+                trace.append({
+                    "kind": "tool",
+                    "name": name,
+                    "args": args,
+                    "ms": round((time.perf_counter() - _t_tool) * 1000),
+                    "result_len": len(str(content)),
+                })
             model_messages.append({
                 "tool_call_id": tool_call.id,
                 "role": "tool",
@@ -385,6 +448,12 @@ def build_messages(session_id: str, query: str, context: str) -> list[dict]:
 # ----------------------------------------------------------------------------
 # 接口
 # ----------------------------------------------------------------------------
+@app.get("/traces/{session_id}")
+async def traces(session_id: str, limit: int = 20):
+    """回放某个会话最近的请求轨迹（最新的在前）。"""
+    return {"session_id": session_id, "traces": get_traces(session_id, limit)}
+
+
 @app.get("/health")
 async def health():
     """健康检查：部署时用来确认服务活着。"""
@@ -400,13 +469,21 @@ async def chat(request: ChatRequest):
     # 注意：这里不能因为"知识库没资料"就直接兜底。
     # 天气这类问题本来就不在知识库里，答案是靠工具查的，
     # 提前返回会让工具永远没机会被调用。兜底放在"模型没调工具"之后。
+    trace: list[dict] = []
+    _t_ret = time.perf_counter()
     context = get_school_context(query)
+    trace.append({
+        "kind": "retrieval",
+        "hits": context.count("\n---\n") + 1 if context.strip() else 0,
+        "chars": len(context),
+        "ms": round((time.perf_counter() - _t_ret) * 1000),
+    })
     messages = build_messages(request.session_id, query, context)
     max_retries = 3
 
     for attempt in range(max_retries):
         try:
-            answer, used_tool, rounds = run_agent(messages)     #这个message就是model——message
+            answer, used_tool, rounds = run_agent(messages, trace=trace)     #这个message就是model——message
             log.info(
                 "agent 完成 rounds=%d used_tool=%s session=%s",
                 rounds, used_tool, request.session_id,
@@ -420,6 +497,8 @@ async def chat(request: ChatRequest):
                 # 没调工具、知识库没资料、也完全没有历史摘要：这才说明我们答不了。
                 # 有摘要时必须放行——用户可能在问上下文里早就说过的事（"刚才那个电话是多少"）。
                 log.info("无资料且未调用工具，返回兜底 session=%s", request.session_id)
+                trace.append({"kind": "no_data", "reason": "no_context_no_tool_no_summary"})
+                save_trace(request.session_id, trace)
                 return {"answer": NO_DATA_ANSWER}
 
             final_answer = answer
@@ -432,6 +511,13 @@ async def chat(request: ChatRequest):
             append_message(request.session_id, "assistant", final_answer)
             maybe_compress(request.session_id)
 
+            trace.append({
+                "kind": "answer",
+                "chars": len(final_answer),
+                "rounds": rounds,
+                "used_tool": used_tool,
+            })
+            save_trace(request.session_id, trace)
             return {"answer": final_answer}
 
         except RateLimitError:
