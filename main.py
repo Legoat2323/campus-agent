@@ -193,6 +193,62 @@ tools = [
 ]
 
 
+# ----------------------------------------------------------------------------
+# Agent 循环（D1）：工具注册表 + 多轮调用 + 终止条件
+# ----------------------------------------------------------------------------
+TOOLS_REGISTRY = {
+    "get_weather": lambda args: get_weather(args.get("city")),
+}
+
+MAX_TOOL_ROUNDS = 3
+
+
+def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS):
+    """跑一次 agent 循环。返回 (answer, used_tool, rounds)。
+
+    answer 为 None 表示"到轮数上限还没收口"。
+    """
+    used_tool = False  # 初始时先假设没用过工具
+    for rnd in range(1, max_rounds + 1):
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=model_messages,
+            temperature=MODEL_TEMPERATURE,
+            tools=tools,            # 每一轮都带 tools，模型才能连续调
+            tool_choice="auto",
+        )
+        msg = resp.choices[0].message
+
+        if not msg.tool_calls:
+            return msg.content, used_tool, rnd     # 收口：模型不再要工具
+
+        used_tool = True
+        model_messages.append(msg)                 # 把"我要调工具"这步记进上下文
+        for tool_call in msg.tool_calls:
+            name = tool_call.function.name
+            handler = TOOLS_REGISTRY.get(name)
+            try:
+                args = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            if handler is None:
+                content = f"未知工具：{name}"
+            else:
+                try:
+                    content = handler(args)
+                except Exception as e:             # 工具自己崩了，别让整个请求挂掉
+                    log.warning("工具执行失败 tool=%s err=%s", name, e)
+                    content = f"工具执行失败：{e}"
+            model_messages.append({
+                "tool_call_id": tool_call.id,
+                "role": "tool",
+                "name": name,
+                "content": content,
+            })
+
+    return None, used_tool, max_rounds
+
+
 def build_messages(session_id: str, query: str, context: str) -> list[dict]:
     messages = [{"role": "system", "content": SYSTEM_PROMPT_TMPL.format(context=context)}]
     messages.extend(load_history(session_id))
@@ -224,33 +280,22 @@ async def chat(request: ChatRequest):
 
     for attempt in range(max_retries):
         try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME, messages=messages, temperature=MODEL_TEMPERATURE, tools=tools, tool_choice="auto"
+            answer, used_tool, rounds = run_agent(messages)     #这个message就是model——message
+            log.info(
+                "agent 完成 rounds=%d used_tool=%s session=%s",
+                rounds, used_tool, request.session_id,
             )
-            response_message = response.choices[0].message
-            final_answer = None
 
-            if response_message.tool_calls:
-                messages.append(response_message)
-                for tool_call in response_message.tool_calls:
-                    if tool_call.function.name == "get_weather":
-                        args = json.loads(tool_call.function.arguments)
-                        messages.append({
-                            "tool_call_id": tool_call.id,
-                            "role": "tool",
-                            "name": tool_call.function.name,
-                            "content": get_weather(args.get("city")),
-                        })
-                second = client.chat.completions.create(
-                    model=MODEL_NAME, messages=messages, temperature=MODEL_TEMPERATURE
-                )
-                final_answer = second.choices[0].message.content
-            else:
-                # 没调工具：知识库也没有资料，说明这个问题我们答不了
-                if not context.strip():
-                    log.info("无资料且未调用工具，返回兜底 session=%s", request.session_id)
-                    return {"answer": NO_DATA_ANSWER}
-                final_answer = response_message.content
+            if answer is None:
+                # 到轮数上限还没收口：当作答不出来，别再让它继续调
+                log.warning("agent 达到轮数上限 session=%s", request.session_id)
+                answer = "我查了几次还是没查准，你能说得更具体一点吗？"
+            elif not used_tool and not context.strip():
+                # 没调工具、知识库也没资料：说明这个问题我们答不了
+                log.info("无资料且未调用工具，返回兜底 session=%s", request.session_id)
+                return {"answer": NO_DATA_ANSWER}
+
+            final_answer = answer
 
             if not final_answer:
                 final_answer = "抱歉，我这边没有生成有效回答，请再问一次。"
@@ -300,15 +345,16 @@ async def chat_stream(request: ChatRequest):
             response_message = first.choices[0].message
 
             if response_message.tool_calls:
-                messages.append(response_message)
+                # 第二阶段不传 tools：历史里若留着结构化的 tool_calls，
+                # 模型看到"有调用但没有工具定义"，会把调用原样复述成文本（页面上会漏出 JSON）。
+                # 所以这里把"调用 + 结果"压成一条普通人话再发。
                 for tool_call in response_message.tool_calls:
                     if tool_call.function.name == "get_weather":
                         args = json.loads(tool_call.function.arguments)
+                        result = get_weather(args.get("city"))
                         messages.append({
-                            "tool_call_id": tool_call.id,
-                            "role": "tool",
-                            "name": tool_call.function.name,
-                            "content": get_weather(args.get("city")),
+                            "role": "assistant",
+                            "content": f"（已调用工具 get_weather 查询{args.get('city', '')}，返回：{result}）",
                         })
                 yield "data: [系统提示：已获取实时天气，正在生成回答...]\n\n"
             elif not context.strip():
