@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import sqlite3
 import main
 
 try:
@@ -54,8 +55,15 @@ def run():
     rows = []
 
     for i, (question, keywords, no_answer, note) in enumerate(CASES):
-        # 每题一个独立 session_id，避免历史串扰
-        ctx, answer = ask_prod(question, f"prodtest-{i}")
+        # 每题一个独立 session_id，避免历史串扰。
+        # ⚠️ 还要先清掉这个 sid 上一次跑留下的 messages/summaries，
+        #    否则第二次跑时"摘要"会让 chat() 绕过多资料兜底，拒答率凭空掉。
+        sid = f"prodtest-{i}"
+        with sqlite3.connect(main.DB_PATH) as c:
+            c.execute("DELETE FROM messages WHERE session_id=?", (sid,))
+            c.execute("DELETE FROM summaries WHERE session_id=?", (sid,))
+            c.commit()
+        ctx, answer = ask_prod(question, sid)
         has_ctx = bool(ctx.strip())
         ctx_flag = f"{len(ctx)}字" if has_ctx else "空"
         flat = answer.replace("\n", " ")[:44]

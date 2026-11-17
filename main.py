@@ -94,6 +94,16 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_session ON messages(session_id, id)"
         )
+        # D2：被"压缩掉"的历史不再直接删，而是先压成一段摘要存这里
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS summaries (
+                session_id TEXT PRIMARY KEY,
+                content    TEXT NOT NULL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         conn.commit()
 
 
@@ -127,6 +137,117 @@ def trim_history(session_id: str, keep: int = HISTORY_LIMIT) -> None:
         )
         conn.commit()
 
+
+# ----------------------------------------------------------------------------
+# D2：上下文压缩
+#   原来 trim_history 直接把 6 条以外的对话删掉 —— 信息就真没了。
+#   现在改成：超出的部分先让模型压成一段"事实清单"，存进 summaries，
+#   再删原消息。下次对话时把摘要拼进 system prompt。
+# ----------------------------------------------------------------------------
+SUMMARY_TRIGGER = 8   # 消息数超过它才触发压缩
+KEEP_RECENT = 6       # 最近 6 条（3 轮）保留原文
+SUMMARY_MAX_CHARS = 200
+
+SUMMARY_PROMPT = (
+    "把下面的对话压缩成一段不超过 {limit} 字的事实清单。\n"
+    "只保留：用户问过什么、回答里给过哪些关键数字/时间/地点/电话。\n"
+    "不要寒暄，不要解释，不要评论，用'；'分隔。\n\n{dialog}"
+)
+
+# 只有当"旧摘要 + 新摘要"超过上限时才用这一次，把两段再压成一段
+MERGE_PROMPT = (
+    "下面是一份事实清单，请在不丢失任何事实的前提下压缩到 {limit} 字以内。\n"
+    "数字、电话、时间、地点一律照抄，不许省略。用'；'分隔，不要解释。\n\n{facts}"
+)
+
+
+def load_summary(session_id: str) -> str:
+    """取这个会话已有的摘要，没有就返回空串。"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute(
+            "SELECT content FROM summaries WHERE session_id=?", (session_id,)
+        ).fetchone()
+    return row[0] if row else ""
+
+
+def save_summary(session_id: str, content: str) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "INSERT INTO summaries (session_id, content, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(session_id) DO UPDATE SET content=excluded.content, updated_at=CURRENT_TIMESTAMP",
+            (session_id, content),
+        )
+        conn.commit()
+
+
+def load_all_messages(session_id: str) -> list[tuple[int, str, str]]:
+    """取这个会话的全部消息（id, role, content），按时间正序。压缩要用 id 才能删准。"""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        rows = conn.execute(
+            "SELECT id, role, content FROM messages WHERE session_id=? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+    return rows
+
+
+def delete_messages(ids: list[int]) -> None:
+    if not ids:
+        return
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.executemany("DELETE FROM messages WHERE id=?", [(i,) for i in ids])
+        conn.commit()
+
+
+def maybe_compress(session_id: str) -> None:
+    """消息超过阈值时，把最早那批压成摘要再删。
+
+    返回 None；失败不要抛异常（压缩失败就让消息留着，下次再试）。
+    """
+    old_summary = load_summary(session_id)  # ⚠️ 不能忽略
+
+
+    rows = load_all_messages(session_id)
+    if len(rows) <= SUMMARY_TRIGGER:
+        return
+
+    old_rows = rows[:-KEEP_RECENT]
+    if not old_rows:
+        return
+
+
+    dialog_parts = []
+    for _, role, content in old_rows:
+        who = "用户" if role == "user" else "助手"
+        dialog_parts.append(f"{who}: {content}")
+    dialog = "\n".join(dialog_parts)
+
+    def _ask(prompt: str) -> str:
+        r = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        return (r.choices[0].message.content or "").strip()
+
+    try:
+        # 只让它压"新增的那几条"。合并旧摘要这件事交给代码做 —— 模型做合并会丢事实。
+        piece = _ask(SUMMARY_PROMPT.format(limit=SUMMARY_MAX_CHARS, dialog=dialog))
+        if not piece:
+            log.warning("压缩返回空 session=%s", session_id)
+            return
+
+        merged = "；".join(x for x in (old_summary, piece) if x)
+
+        # 拼接后超长，才让模型统一再压一次（此时要求"数字照抄、不许省略"）
+        if len(merged) > SUMMARY_MAX_CHARS:
+            merged = _ask(MERGE_PROMPT.format(limit=SUMMARY_MAX_CHARS, facts=merged)) or merged
+
+        save_summary(session_id, merged[: SUMMARY_MAX_CHARS * 2])
+        delete_messages([mid for mid, _, _ in old_rows])
+        log.info("压缩完成 session=%s 压掉 %d 条 -> 摘要 %d 字",
+                 session_id, len(old_rows), len(merged))
+    except Exception as e:
+        log.warning("压缩失败 session=%s err=%s", session_id, e)
 
 init_db()
 
@@ -250,7 +371,12 @@ def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS):
 
 
 def build_messages(session_id: str, query: str, context: str) -> list[dict]:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT_TMPL.format(context=context)}]
+    system_content = SYSTEM_PROMPT_TMPL.format(context=context)
+    summary_text = load_summary(session_id)
+    if summary_text:
+        # 摘要放 system 里，和检索到的资料一起给模型
+        system_content += f"\n\n【此前对话摘要】{summary_text}"
+    messages = [{"role": "system", "content": system_content}]
     messages.extend(load_history(session_id))
     messages.append({"role": "user", "content": query})
     return messages
@@ -290,8 +416,9 @@ async def chat(request: ChatRequest):
                 # 到轮数上限还没收口：当作答不出来，别再让它继续调
                 log.warning("agent 达到轮数上限 session=%s", request.session_id)
                 answer = "我查了几次还是没查准，你能说得更具体一点吗？"
-            elif not used_tool and not context.strip():
-                # 没调工具、知识库也没资料：说明这个问题我们答不了
+            elif not used_tool and not context.strip() and not load_summary(request.session_id):
+                # 没调工具、知识库没资料、也完全没有历史摘要：这才说明我们答不了。
+                # 有摘要时必须放行——用户可能在问上下文里早就说过的事（"刚才那个电话是多少"）。
                 log.info("无资料且未调用工具，返回兜底 session=%s", request.session_id)
                 return {"answer": NO_DATA_ANSWER}
 
@@ -303,7 +430,7 @@ async def chat(request: ChatRequest):
             # 写入记忆并裁剪
             append_message(request.session_id, "user", query)
             append_message(request.session_id, "assistant", final_answer)
-            trim_history(request.session_id)
+            maybe_compress(request.session_id)
 
             return {"answer": final_answer}
 
@@ -357,7 +484,7 @@ async def chat_stream(request: ChatRequest):
                             "content": f"（已调用工具 get_weather 查询{args.get('city', '')}，返回：{result}）",
                         })
                 yield "data: [系统提示：已获取实时天气，正在生成回答...]\n\n"
-            elif not context.strip():
+            elif not context.strip() and not load_summary(request.session_id):
                 log.info("无资料且未调用工具，流式返回兜底 session=%s", request.session_id)
                 yield f"data: {NO_DATA_ANSWER}\n\n"
                 return
@@ -374,7 +501,7 @@ async def chat_stream(request: ChatRequest):
 
             append_message(request.session_id, "user", query)
             append_message(request.session_id, "assistant", full_answer)
-            trim_history(request.session_id)
+            maybe_compress(request.session_id)
             log.info("流式回答完成 session=%s 长度=%d", request.session_id, len(full_answer))
 
         except Exception:
