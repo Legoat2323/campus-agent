@@ -154,7 +154,6 @@ campus-agent/
 - 没做鉴权、没限流、没配 CORS，只能本地跑
 - `langchain_community` 里的 Chroma 已经废弃了，要迁移到 `langchain_chroma`
 - 刷新页面就换一个 session_id，之前的对话找不回来 —— 该存 localStorage
-- `messages.session_id` 没有索引，数据量大了会全表扫
 - 孤儿会话没有清理策略（按 30 天过期之类）
 - 指代消解没做：「刚才那个电话是多少」里没有"招生办"，检索抓不到，只能靠摘要
 
