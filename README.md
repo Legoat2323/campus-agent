@@ -153,9 +153,8 @@ campus-agent/
 - 出错时返回 `{"error": ...}` 但 HTTP 状态码还是 200，应该用 HTTPException
 - 没做鉴权、没限流、没配 CORS，只能本地跑
 - `langchain_community` 里的 Chroma 已经废弃了，要迁移到 `langchain_chroma`
-- 刷新页面就换一个 session_id，之前的对话找不回来 —— 该存 localStorage
 - 孤儿会话没有清理策略（按 30 天过期之类）
-- 指代消解没做：「刚才那个电话是多少」里没有"招生办"，检索抓不到，只能靠摘要
+- 指代参考只在"最近 4 条 + 摘要"里找，再久之前的指代会因为摘要变粗而丢掉
 
 ## 查询改写（D4，指代消解）
 
