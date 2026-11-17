@@ -318,6 +318,32 @@ SYSTEM_PROMPT_TMPL = """你是桂林电子科技大学的校园助手，服务�
 
 NO_DATA_ANSWER = "这个问题我这边没有相关资料，建议咨询辅导员或查看学校官网。"
 
+# D4：带历史的查询改写（指代消解）
+# 为什么需要：用户第二句常是"刚才那个电话是多少"，这句话里没有"招生办"，
+# 向量和 BM25 都抓不到；改写把它补全成"招生办的电话是多少"再去检索。
+ENABLE_QUERY_REWRITE = True
+REWRITE_PROMPT = """把【当前问题】改写成一句独立、可直接用于检索的问句。
+
+规则：
+1. 如果当前问题里有指代词（刚才 / 上面 / 这个 / 那个 / 它 / 他 / 该 / 此），必须从【对话历史】里找到它指的具体事物，把那个词**替换进去**。
+2. 改写后的句子里**不许再出现任何指代词**。出现就说明你没做完。
+3. 如果当前问题本身已经完整（没有指代），**原样返回**，不许加词、不许扩写、不许换说法。
+4. 只输出改写后的那一句，不要解释，不要加引号。
+
+示例：
+历史：
+用户: 招生办的电话是多少？
+助手: 招生办的电话是0773-2290010。
+当前问题：刚才那个电话是多少？
+正确改写：招生办的电话是多少？
+错误改写：刚才的电话是多少？（还留着"刚才"，等于没改）
+
+【对话历史】
+{history}
+
+【当前问题】
+{query}"""
+
 
 def get_school_context(question: str) -> str:
     """检索知识库，只返回相关度够高的片段。"""
@@ -433,6 +459,57 @@ def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS, trace=None):
     return None, used_tool, max_rounds
 
 
+def rewrite_query(query: str, session_id: str, trace=None) -> str:
+    """把"刚才那个电话"这类带指代的问题补全成可检索的问句。
+
+    没有历史就原样返回（第一轮没必要多花一次模型调用）。
+    改写失败也原样返回——改写是优化，不能变成故障点。
+    """
+    if not ENABLE_QUERY_REWRITE:
+        return query
+
+    hist = load_history(session_id, limit=4)
+    summary_text = load_summary(session_id)
+    if not hist and not summary_text:
+        return query
+
+    lines = []
+    if summary_text:
+        lines.append(f"（更早的对话摘要）{summary_text}")
+    for m in hist:
+        who = "用户" if m["role"] == "user" else "助手"
+        lines.append(f"{who}: {m['content'][:120]}")
+    history_text = "\n".join(lines[-6:]) or "（无）"
+
+    _t = time.perf_counter()
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user",
+                       "content": REWRITE_PROMPT.format(history=history_text, query=query)}],
+            temperature=0,
+        )
+        rewritten = (resp.choices[0].message.content or "").strip().strip('"').strip("“”")
+    except Exception as e:
+        log.warning("查询改写失败，用原句 session=%s err=%s", session_id, e)
+        return query
+
+    # 改写结果太短/太长都要怀疑，宁可退回原句
+    if not (2 <= len(rewritten) <= 60):
+        return query
+
+    if rewritten != query:
+        log.info("查询改写 %s -> %s", query, rewritten)
+        if trace is not None:
+            trace.append({
+                "kind": "rewrite",
+                "from": query,
+                "to": rewritten,
+                "ms": round((time.perf_counter() - _t) * 1000),
+            })
+    return rewritten
+
+
 def build_messages(session_id: str, query: str, context: str) -> list[dict]:
     system_content = SYSTEM_PROMPT_TMPL.format(context=context)
     summary_text = load_summary(session_id)
@@ -470,8 +547,9 @@ async def chat(request: ChatRequest):
     # 天气这类问题本来就不在知识库里，答案是靠工具查的，
     # 提前返回会让工具永远没机会被调用。兜底放在"模型没调工具"之后。
     trace: list[dict] = []
+    search_query = rewrite_query(query, request.session_id, trace)
     _t_ret = time.perf_counter()
-    context = get_school_context(query)
+    context = get_school_context(search_query)
     trace.append({
         "kind": "retrieval",
         "hits": context.count("\n---\n") + 1 if context.strip() else 0,
@@ -544,7 +622,8 @@ async def chat_stream(request: ChatRequest):
 
     # 和 /chat 一样：不能因为知识库没资料就提前返回，否则工具永远调不到。
     # 兜底放在"模型决定不调工具"之后（见 generate 里的 elif）。
-    context = get_school_context(query)
+    search_query = rewrite_query(query, request.session_id)
+    context = get_school_context(search_query)
     messages = build_messages(request.session_id, query, context)
 
     def generate():

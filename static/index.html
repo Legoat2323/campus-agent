@@ -98,8 +98,13 @@
     const inputEl = document.getElementById('q');
     const sendEl = document.getElementById('send');
 
-    // 每个页面一个会话 id，后端靠它区分别人的记忆
-    const sessionId = 'sess_' + Math.random().toString(36).slice(2, 10);
+    // 会话 id：刷新页面也要用同一个，否则之前的对话就找不回来了。
+    // 存在 localStorage 里，第一次进来才生成。
+    let sessionId = localStorage.getItem('chat_sid');
+    if (!sessionId) {
+      sessionId = 'sess_' + Math.random().toString(36).slice(2, 10);
+      localStorage.setItem('chat_sid', sessionId);
+    }
 
     function addBubble(text, role) {
       const div = document.createElement('div');
