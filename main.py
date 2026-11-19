@@ -475,6 +475,37 @@ def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS, trace=None):
     return None, used_tool, max_rounds
 
 
+# D4 前置门：不是所有"多轮问题"都需要改写。
+# 判据只有两类：句子里有指代（它/那个/刚才…），或者短到必须靠上文才懂（"那学费呢"）。
+DEICTIC = ("刚才", "上次", "上面", "前面", "这个", "那个", "这些", "那些",
+           "它", "该", "此", "还有")
+TIME_WORDS = ("今天", "现在", "目前", "最近", "最新", "今年", "马上")
+
+
+def need_rewrite(query: str, has_history: bool) -> bool:
+    """要不要为了检索去改写这句话。False 时一句话都不多花。"""
+    if not has_history:
+        return False                       # 第一轮，没有可比对的上文
+    q = query.strip()
+    if any(w in q for w in DEICTIC):
+        return True                        # 有指代，必须补全
+    if len(q) <= 6:
+        return True                        # "那学费呢"这类省略句
+    return False                           # 自带实体、能独立检索 -> 不改
+
+
+def rewrite_ok(query: str, rewritten: str) -> bool:
+    """改写结果的出口校验：不合格就退回原句。"""
+    if not (2 <= len(rewritten) <= 60):
+        return False
+    if any(w in rewritten for w in DEICTIC):
+        return False                       # 还有指代 = 没改完
+    for w in TIME_WORDS:
+        if w in rewritten and w not in query:
+            return False                   # 引入了原句没有的时间词
+    return True
+
+
 def rewrite_query(query: str, session_id: str, trace=None) -> str:
     """把"刚才那个电话"这类带指代的问题补全成可检索的问句。
 
@@ -486,7 +517,7 @@ def rewrite_query(query: str, session_id: str, trace=None) -> str:
 
     hist = load_history(session_id, limit=4)
     summary_text = load_summary(session_id)
-    if not hist and not summary_text:
+    if not need_rewrite(query, bool(hist or summary_text)):
         return query
 
     lines = []
@@ -510,8 +541,9 @@ def rewrite_query(query: str, session_id: str, trace=None) -> str:
         log.warning("查询改写失败，用原句 session=%s err=%s", session_id, e)
         return query
 
-    # 改写结果太短/太长都要怀疑，宁可退回原句
-    if not (2 <= len(rewritten) <= 60):
+    # 出口校验：太短太长、还有指代、凭空加了时间词 -> 一律退回原句
+    if not rewrite_ok(query, rewritten):
+        log.info("改写结果不合格，退回原句 「%s」 -> 「%s」", query, rewritten)
         return query
 
     if rewritten != query:
