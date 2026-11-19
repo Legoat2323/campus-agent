@@ -1,0 +1,12 @@
+.venv/
+.git/
+.idea/
+__pycache__/
+*.log
+*.pyc
+.env
+memory.db
+e1_answers.json
+test_*.py
+campus-test-qa-*.py
+verify_d*.py

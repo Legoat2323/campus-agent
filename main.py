@@ -328,7 +328,9 @@ REWRITE_PROMPT = """把【当前问题】改写成一句独立、可直接用于
 1. 如果当前问题里有指代词（刚才 / 上面 / 这个 / 那个 / 它 / 他 / 该 / 此），必须从【对话历史】里找到它指的具体事物，把那个词**替换进去**。
 2. 改写后的句子里**不许再出现任何指代词**。出现就说明你没做完。
 3. 如果当前问题本身已经完整（没有指代），**原样返回**，不许加词、不许扩写、不许换说法。
-4. 只输出改写后的那一句，不要解释，不要加引号。
+4. **不许添加原文没有的词**——尤其时间词（今天 / 现在 / 最近 / 最新）和限定词（2026级 / 全部 / 详细）。
+   加词会改变向量方向，让原本能命中的片段掉出阈值。
+5. 只输出改写后的那一句，不要解释，不要加引号。
 
 示例：
 历史：
@@ -345,12 +347,23 @@ REWRITE_PROMPT = """把【当前问题】改写成一句独立、可直接用于
 {query}"""
 
 
-def get_school_context(question: str) -> str:
-    """检索知识库，只返回相关度够高的片段。"""
+def get_school_context(question: str, fallback: str | None = None) -> str:
+    """检索知识库，只返回相关度够高的片段。
+
+    fallback：查询改写后如果一条都没命中，就用用户原句再查一次。
+    改写的本意是帮忙，但加词会让向量偏移、把能命中的片段推出阈值——
+    这时候退回原句比"诚实地答不知道"更好。
+    """
     try:
         results = vectorstore.similarity_search_with_score(question, k=3)
         useful = [doc for doc, score in results if score < MAX_DISTANCE]
         log.info("检索命中 %d/%d 条（阈值 %.1f）", len(useful), len(results), MAX_DISTANCE)
+
+        if not useful and fallback and fallback != question:
+            results2 = vectorstore.similarity_search_with_score(fallback, k=3)
+            useful = [doc for doc, score in results2 if score < MAX_DISTANCE]
+            log.info("改写后 0 命中，回退原句「%s」命中 %d/%d 条", fallback, len(useful), len(results2))
+
         return "\n".join(doc.page_content for doc in useful)
     except Exception:
         log.exception("检索出错，按无资料处理")
@@ -549,7 +562,7 @@ async def chat(request: ChatRequest):
     trace: list[dict] = []
     search_query = rewrite_query(query, request.session_id, trace)
     _t_ret = time.perf_counter()
-    context = get_school_context(search_query)
+    context = get_school_context(search_query, fallback=query)
     trace.append({
         "kind": "retrieval",
         "hits": context.count("\n---\n") + 1 if context.strip() else 0,
@@ -623,7 +636,7 @@ async def chat_stream(request: ChatRequest):
     # 和 /chat 一样：不能因为知识库没资料就提前返回，否则工具永远调不到。
     # 兜底放在"模型决定不调工具"之后（见 generate 里的 elif）。
     search_query = rewrite_query(query, request.session_id)
-    context = get_school_context(search_query)
+    context = get_school_context(search_query, fallback=query)
     messages = build_messages(request.session_id, query, context)
 
     def generate():

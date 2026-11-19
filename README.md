@@ -233,3 +233,26 @@ campus-agent/
 
 代价：同一个 session 里再问文档外的问题，模型会硬答（可能编），不再直接回"没有相关资料"。
 守门的是 prompt 规则 1/2（只依据资料、没有就说没提），实测 20 题开发集 A 9/12、B 拒答 8/8 没有退化。
+
+## Docker 部署
+
+```bash
+# 构建（依赖层有缓存；首次联网装依赖约 3-4 分钟，用清华源）
+docker build --build-arg PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple -t campus-agent .
+
+# 运行（挂载代码目录：改代码不用重建镜像）
+docker run --rm -p 8000:8000 --env-file .env -v "${PWD}:/app" campus-agent
+
+# 浏览器打开 http://127.0.0.1:8000
+```
+
+**两个细节**
+
+- `-v "${PWD}:/app"` 把本目录挂进容器：改 `main.py` 后重启容器即刻生效，且 `memory.db` 天然持久化
+- 上线时去掉这个挂载，用镜像里的代码（`docker run -p 8000:8000 --env-file .env campus-agent`）
+
+**踩过的坑**
+
+1. `requirements.txt` 原为 UTF-16LE，Linux 下 pip 报 `Invalid requirement: '\xff\xfea'` → 转 UTF-8
+2. 在 `C:\Users\...` 下 build 会报 `open Dockerfile: no such file` → 先 `cd` 到项目目录
+3. `--build-arg PIP_INDEX` 变了会击穿缓存、重装全部依赖 → 每次用同一个源
