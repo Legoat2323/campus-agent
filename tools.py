@@ -20,6 +20,7 @@ def tool_get_weather(args: dict) -> str:
 
 
 def tool_search_school(args: dict) -> str:
+    from main import get_school_context   # 延迟导入：打破 main <-> tools 的循环依赖
     question = (args or {}).get("question", "").strip()
     if not question:
         return "缺少 question 参数"

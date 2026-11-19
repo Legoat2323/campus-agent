@@ -112,3 +112,4 @@ websockets==17.3
 xxhash==4.0.2
 yarl==1.25.1
 zstandard==0.25.0
+mcp[cli]<2

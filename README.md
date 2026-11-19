@@ -257,3 +257,23 @@ docker run --rm -p 8000:8000 --env-file .env -v "${PWD}:/app" campus-agent
 1. `requirements.txt` 原为 UTF-16LE，Linux 下 pip 报 `Invalid requirement: '\xff\xfea'` → 转 UTF-8
 2. 在 `C:\Users\...` 下 build 会报 `open Dockerfile: no such file` → 先 `cd` 到项目目录
 3. `--build-arg PIP_INDEX` 变了会击穿缓存、重装全部依赖 → 每次用同一个源
+
+## MCP 服务（stdio）
+
+把 4 个工具用 MCP 协议暴露出去，任何 MCP 客户端（Claude Desktop / Cursor / 自己的 Agent）都能挂上：
+
+```powershell
+# 服务端（stdio，会在前台等客户端，Ctrl+C 退出）
+.\.venv\Scripts\python.exe mcp_server.py
+
+# 用一个最小客户端验证：握手 → 发现工具 → 调用
+.\.venv\Scripts\python.exe mcp_client_test.py
+```
+
+设计要点：**工具定义只在 `tools.py` 写一份**，campus 自己的 agent loop 和 MCP server 都从它取；
+`mcp_server.py` 只是把同一批工具换个方式挂出去，加工具两条路同时生效。
+
+两个坑（都踩过）：
+1. `mcp` 2.x 把 `FastMCP` 改名成 `MCPServer`，生态里绝大多数示例还是 1.x，所以 `requirements.txt` 钉 `mcp[cli]<2`。
+2. **必须 `import main` 在事件循环启动前完成**：等到工具被调用时才初始化 chromadb，
+   Rust 客户端会在运行中的事件循环里创建，整个 server 卡死（实测 150s 超时、客户端 `Connection closed`）。
