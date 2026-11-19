@@ -21,6 +21,7 @@ from openai import OpenAI, RateLimitError
 from pydantic import BaseModel
 
 from weather import get_weather
+from tools import TOOL_SCHEMAS as tools, TOOL_IMPL
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
 
@@ -382,30 +383,11 @@ def get_school_context(question: str, fallback: str | None = None) -> str:
 #   - 带 10 分钟缓存，避免重复请求
 
 
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "查询指定城市的实时天气（真实数据，来自 Open-Meteo）",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string", "description": "城市名称，例如：桂林、北京"}
-                },
-                "required": ["city"],
-            },
-        },
-    }
-]
 
 
 # ----------------------------------------------------------------------------
 # Agent 循环（D1）：工具注册表 + 多轮调用 + 终止条件
 # ----------------------------------------------------------------------------
-TOOLS_REGISTRY = {
-    "get_weather": lambda args: get_weather(args.get("city")),
-}
 
 MAX_TOOL_ROUNDS = 3
 
@@ -443,7 +425,7 @@ def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS, trace=None):
         model_messages.append(msg)                 # 把"我要调工具"这步记进上下文
         for tool_call in msg.tool_calls:
             name = tool_call.function.name
-            handler = TOOLS_REGISTRY.get(name)
+            handler = TOOL_IMPL.get(name)
             try:
                 args = json.loads(tool_call.function.arguments or "{}")
             except json.JSONDecodeError:
@@ -489,7 +471,7 @@ def need_rewrite(query: str, has_history: bool) -> bool:
     q = query.strip()
     if any(w in q for w in DEICTIC):
         return True                        # 有指代，必须补全
-    if len(q) <= 6:
+    if q.startswith(("那", "这", "它", "还有")):
         return True                        # "那学费呢"这类省略句
     return False                           # 自带实体、能独立检索 -> 不改
 
