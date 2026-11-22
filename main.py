@@ -406,15 +406,34 @@ _WEATHER_RE = re.compile(
 )
 
 
-def try_answer_weather(query: str, force: bool = False) -> str | None:
+def recent_city(session_id: str, lookback: int = 8) -> str | None:
+    """从最近几轮对话里找城市名（越近越优先）。
+
+    反例：上一轮聊"广州天气"，这一轮只问"下雨了吗"——
+    当前句没有城市，但意图继承了上一轮的广州。
+    """
+    for _id, _role, content in reversed(load_all_messages(session_id)[-lookback:]):
+        c = content or ""
+        for city in CITY_COORD:
+            if city in c:
+                return city
+    return None
+
+
+def try_answer_weather(query: str, force: bool = False, session_id: str | None = None) -> str | None:
     """命中天气问题就返回答案（或固定失败话术）；不是天气问题返回 None。
 
     force=True 用于"上下文已判定是天气追问"的场景（用户只回了一个城市名，
     句子里没有"天气"两个字，但意图明确）。
+    当前句没城市时，先回退到最近几轮说过的城市；还没有才反问。
     """
     if not force and not _WEATHER_RE.search(query):
         return None
     city = next((c for c in CITY_COORD if c in query), None)
+    if city is None and session_id:
+        city = recent_city(session_id)
+        if city:
+            log.info("天气问题未带城市，沿用上文城市=%s session=%s", city, session_id)
     if city is None:
         return "你想查哪个城市的天气？告诉我城市名就行。"
     return get_weather(city)          # 失败时它自己返回"天气服务暂时连不上…"
@@ -745,7 +764,7 @@ async def chat_stream(request: ChatRequest):
     # 纯城市名追问（上一轮在聊天气，这一轮只回"桂林"）：意图唯一，直接查，不劳模型。
     # 实测这种句子交给模型时，它有时调了工具却仍回"没有相关资料"。
     if wants_weather(query, request.session_id) and not _WEATHER_RE.search(query):
-        fb0 = try_answer_weather(query, force=True)
+        fb0 = try_answer_weather(query, force=True, session_id=request.session_id)
         if fb0 is not None:
             append_message(request.session_id, "user", query)
             append_message(request.session_id, "assistant", fb0)
@@ -796,7 +815,7 @@ async def chat_stream(request: ChatRequest):
                 # 模型调了工具，但可能调的不是该调的那个（实测：问天气它去调 get_current_time）。
                 # 意图是天气、却没调 get_weather → 补一次，别让它拿别的工具结果编天气。
                 if wants_weather(query, request.session_id) and "get_weather" not in called_tools:
-                    fb2 = try_answer_weather(query, force=True)
+                    fb2 = try_answer_weather(query, force=True, session_id=request.session_id)
                     if fb2 is not None:
                         log.info("模型调错工具，代码补调天气 session=%s", request.session_id)
                         tool_notes.append(str(fb2))
@@ -808,7 +827,7 @@ async def chat_stream(request: ChatRequest):
             else:
                 # 模型判断"不用调工具" → 代码校验：它是不是漏了一次该做的工具调用？
                 # 只对"有确定性数据源"的天气类做，且只补调一次。
-                fb = try_answer_weather(query, force=True) if wants_weather(query, request.session_id) else None
+                fb = try_answer_weather(query, force=True, session_id=request.session_id) if wants_weather(query, request.session_id) else None
                 if fb is not None and fb.startswith("你想查哪个城市"):
                     # 生成器里不能 return 一个 StreamingResponse（那只是结束生成器，客户端收不到内容）
                     append_message(request.session_id, "user", query)
