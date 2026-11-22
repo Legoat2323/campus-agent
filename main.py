@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from weather import get_weather
 from tools import TOOL_SCHEMAS as tools, TOOL_IMPL
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import Chroma  #这是langchain的向量数据库
 from langchain_openai import OpenAIEmbeddings
 
 load_dotenv()
@@ -46,6 +46,7 @@ client = OpenAI(
     base_url="https://open.bigmodel.cn/api/paas/v4/",
 )
 
+#向量化的工具
 embeddings = OpenAIEmbeddings(
     api_key=os.getenv("ZHIPU_API_KEY"),
     base_url="https://open.bigmodel.cn/api/paas/v4/",
@@ -62,7 +63,7 @@ app = FastAPI(title="我的校园Agent")
 #   A 组 12 题「含答案片段」距离 0.555 ~ 1.162，B 组 8 题「最相似片段」1.024 ~ 1.203。
 #   两个分布重叠 → 距离分不开「话题像不像」和「事实在不在」。
 #   取 1.05：A 组放行 9/12、B 组 0 题被误放行（靠 prompt 兜底 8/8），综合 17/20。
-#   放宽到 1.20 能救回 12/12，但 B 组会有一半题拿到「相近但不含答案」的上下文，飘到 5~8/8。
+#   放宽到 1.20 能救回 12/12，但 B 组会有一半题拿到「相近但不含答案」的上下文，飘到 5~8/8。  所以这里有个取舍的存在
 MAX_DISTANCE = 1.05
 MODEL_NAME = "glm-4-flash"
 MODEL_TEMPERATURE = 0.0  # 0.0：有资料时结果可复现（实测两次均 11/12）；无资料靠代码短路兜底
@@ -81,6 +82,7 @@ HISTORY_LIMIT = 6  # 只保留最近 3 轮（user + assistant 各 3 条）
 
 def init_db() -> None:
     with closing(sqlite3.connect(DB_PATH)) as conn:
+        #用来记录用户和ai说的每一句对话 （短期记忆）
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -93,7 +95,7 @@ def init_db() -> None:
             """
         )
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_session ON messages(session_id, id)"
+            "CREATE INDEX IF NOT EXISTS idx_session ON messages(session_id, id)"  #建索引
         )
         # D2：被"压缩掉"的历史不再直接删，而是先压成一段摘要存这里
         conn.execute(
@@ -105,7 +107,7 @@ def init_db() -> None:
             )
             """
         )
-        # D3：一次请求一行，events 是一个 JSON 数组（检索/每轮模型/工具/答案）
+        # D3：一次请求一行，events 是一个 JSON 数组（检索/每轮模型/工具/答案）   trace 全链路追踪
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS traces (
@@ -354,7 +356,7 @@ REWRITE_PROMPT = """把【当前问题】改写成一句独立、可直接用于
 def get_school_context(question: str, fallback: str | None = None) -> str:
     """检索知识库，只返回相关度够高的片段。
 
-    fallback：查询改写后如果一条都没命中，就用用户原句再查一次。
+    fallback：查询改写后如果一条都没命中，就用用户原句再查一次。      fallback是原问句
     改写的本意是帮忙，但加词会让向量偏移、把能命中的片段推出阈值——
     这时候退回原句比"诚实地答不知道"更好。
     """
@@ -691,15 +693,18 @@ async def chat_stream(request: ChatRequest):
                 # 第二阶段不传 tools：历史里若留着结构化的 tool_calls，
                 # 模型看到"有调用但没有工具定义"，会把调用原样复述成文本（页面上会漏出 JSON）。
                 # 所以这里把"调用 + 结果"压成一条普通人话再发。
+                # 把工具结果写进 system，而不是伪造一条 assistant 消息。
+                # 原因：messages 若以 assistant 结尾，模型会认为"轮到用户说了"，直接返回空。
+                tool_notes = []
                 for tool_call in response_message.tool_calls:
-                    if tool_call.function.name == "get_weather":
-                        args = json.loads(tool_call.function.arguments)
-                        result = get_weather(args.get("city"))
-                        messages.append({
-                            "role": "assistant",
-                            "content": f"（已调用工具 get_weather 查询{args.get('city', '')}，返回：{result}）",
-                        })
-                yield "data: [系统提示：已获取实时天气，正在生成回答...]\n\n"
+                    name = tool_call.function.name
+                    try:
+                        args = json.loads(tool_call.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                    tool_notes.append(f"- {name}({json.dumps(args, ensure_ascii=False)}) 返回：{call_tool(name, args)}")
+                messages[0]["content"] += "\n\n【工具结果】\n" + "\n".join(tool_notes)
+                yield "data: [系统提示：已获取实时数据，正在生成回答...]\n\n"
             elif not context.strip() and not load_summary(request.session_id):
                 log.info("无资料且未调用工具，流式返回兜底 session=%s", request.session_id)
                 yield f"data: {NO_DATA_ANSWER}\n\n"
