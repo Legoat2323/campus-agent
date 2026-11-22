@@ -776,8 +776,19 @@ async def chat_stream(request: ChatRequest):
     # 兜底放在"模型决定不调工具"之后（见 generate 里的 elif）。
     # 纯城市名追问（上一轮在聊天气，这一轮只回"桂林"）：意图唯一，直接查，不劳模型。
     # 实测这种句子交给模型时，它有时调了工具却仍回"没有相关资料"。
-    if wants_weather(query, request.session_id) and not _WEATHER_RE.search(query):
-        fb0 = try_answer_weather(query, force=True, session_id=request.session_id)
+    # 两种情况都直接由代码答：①纯城市名追问（"桂林"）②有天气词但没城市、而上文聊过城市
+    # （"今天天气怎么样呀"，上文是广州）。第②种若交给模型，它会自己挑一个城市
+    # （实测挑了桂林，因为它从系统提示里知道这是桂电项目），答出来的数据是真的、
+    # 但城市是错的——这叫"答错对象"，比编造更难发现。
+    if wants_weather(query, request.session_id):
+        _has_city = any(c in query for c in CITY_COORD)
+        _ctx_city = None if _has_city else recent_city(request.session_id)
+        fb0 = try_answer_weather(query, force=True, session_id=request.session_id) \
+            if (not _has_city) else None
+        if fb0 is not None and fb0.startswith("你想查哪个城市"):
+            fb0 = None
+        if fb0 is None and _ctx_city:
+            fb0 = get_weather(_ctx_city)
         if fb0 is not None:
             append_message(request.session_id, "user", query)
             append_message(request.session_id, "assistant", fb0)
