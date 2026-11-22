@@ -392,6 +392,35 @@ def get_school_context(question: str, fallback: str | None = None) -> str:
 MAX_TOOL_ROUNDS = 3
 
 
+# ---- 工具调用缓存：同一工具 + 同样参数，TTL 内直接复用，避免重复外部请求 ----
+_TOOL_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
+_TOOL_CACHE_TTL = 300          # 秒；天气这类时效性数据 5 分钟足够
+
+
+def call_tool(name: str, args: dict, trace: list | None = None) -> str:
+    """带 TTL 缓存的工具调用。命中缓存时不发起外部请求。"""
+    key = (name, json.dumps(args, ensure_ascii=False, sort_keys=True))
+    now = time.time()
+    hit = _TOOL_CACHE.get(key)
+    if hit and now - hit[0] < _TOOL_CACHE_TTL:
+        log.info("工具缓存命中 tool=%s args=%s", name, key[1])
+        if trace is not None:
+            trace.append({"kind": "cache", "name": name, "args": args})
+        return hit[1]
+
+    handler = TOOL_IMPL.get(name)
+    if handler is None:
+        return f"未知工具：{name}"
+    try:
+        content = handler(args)
+    except Exception as e:                 # 工具自己崩了，别让整个请求挂掉
+        log.warning("工具执行失败 tool=%s err=%s", name, e)
+        return f"工具执行失败：{e}"
+
+    _TOOL_CACHE[key] = (now, content)
+    return content
+
+
 def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS, trace=None):
     """跑一次 agent 循环。返回 (answer, used_tool, rounds)。
 
@@ -425,20 +454,12 @@ def run_agent(model_messages, max_rounds=MAX_TOOL_ROUNDS, trace=None):
         model_messages.append(msg)                 # 把"我要调工具"这步记进上下文
         for tool_call in msg.tool_calls:
             name = tool_call.function.name
-            handler = TOOL_IMPL.get(name)
             try:
                 args = json.loads(tool_call.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
             _t_tool = time.perf_counter()
-            if handler is None:
-                content = f"未知工具：{name}"
-            else:
-                try:
-                    content = handler(args)
-                except Exception as e:             # 工具自己崩了，别让整个请求挂掉
-                    log.warning("工具执行失败 tool=%s err=%s", name, e)
-                    content = f"工具执行失败：{e}"
+            content = call_tool(name, args, trace)
             if trace is not None:
                 trace.append({
                     "kind": "tool",
