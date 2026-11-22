@@ -490,6 +490,17 @@ DEICTIC = ("刚才", "上次", "上面", "前面", "这个", "那个", "这些",
 TIME_WORDS = ("今天", "现在", "目前", "最近", "最新", "今年", "马上")
 
 
+# 同音/形近错别字：不依赖上文，任何时候都该修（"报道"→"报到"这类）
+TYPOS = {"报道": "报到", "帐号": "账号", "宿社": "宿舍", "图书管": "图书馆"}
+
+
+def fix_typos(text: str) -> str:
+    for wrong, right in TYPOS.items():
+        if wrong in text:
+            text = text.replace(wrong, right)
+    return text
+
+
 def need_rewrite(query: str, has_history: bool) -> bool:
     """要不要为了检索去改写这句话。False 时一句话都不多花。"""
     if not has_history:
@@ -499,6 +510,8 @@ def need_rewrite(query: str, has_history: bool) -> bool:
         return True                        # 有指代，必须补全
     if q.startswith(("那", "这", "它", "还有")):
         return True                        # "那学费呢"这类省略句
+    if q.endswith("呢") and len(q) <= 8:
+        return True                        # "深圳的呢"——靠上文才懂
     return False                           # 自带实体、能独立检索 -> 不改
 
 
@@ -520,6 +533,7 @@ def rewrite_query(query: str, session_id: str, trace=None) -> str:
     没有历史就原样返回（第一轮没必要多花一次模型调用）。
     改写失败也原样返回——改写是优化，不能变成故障点。
     """
+    query = fix_typos(query or "")      # 错别字不依赖历史，先修
     if not ENABLE_QUERY_REWRITE:
         return query
 
@@ -687,8 +701,15 @@ async def chat_stream(request: ChatRequest):
         try:
             # 第一阶段：非流式，判断要不要调工具
             # （流式响应里拿不到完整的 tool_calls，所以必须先用非流式问一次）
+            # 流式路径只挂"外部实时数据"类工具。search_school 的结果本该走 context（前面已检索过），
+            # 再当工具结果塞进 system 会和 context 打架，模型就会答"没有相关资料"。
+            stream_tools = [
+                t for t in tools
+                if t["function"]["name"] in ("get_weather", "get_current_time")
+            ]
             first = client.chat.completions.create(
-                model=MODEL_NAME, messages=messages, temperature=MODEL_TEMPERATURE, tools=tools, tool_choice="auto"
+                model=MODEL_NAME, messages=messages, temperature=MODEL_TEMPERATURE,
+                tools=stream_tools, tool_choice="auto",
             )
             response_message = first.choices[0].message
 
@@ -712,7 +733,7 @@ async def chat_stream(request: ChatRequest):
                     "\n\n【已获取的实时数据】\n" + "\n".join(tool_notes)
                     + "\n请直接根据以上数据回答用户，不要复述查询过程，不要输出函数名或参数。"
                 )
-                yield "data: [系统提示：已获取实时数据，正在生成回答...]\n\n"
+                yield "data: [系统提示：正在查询实时信息...]\n\n"
             elif not context.strip() and not load_summary(request.session_id):
                 log.info("无资料且未调用工具，流式返回兜底 session=%s", request.session_id)
                 yield f"data: {NO_DATA_ANSWER}\n\n"
