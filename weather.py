@@ -25,6 +25,20 @@ CITY_ALIAS = {
     "郑州": "Zhengzhou", "南昌": "Nanchang",
 }
 
+# 常用城市坐标（纬度, 经度, 规范名）：命中就跳过 geocoding 请求，省一次网络往返
+CITY_COORD = {
+    "桂林": (25.27, 110.29, "桂林"), "南宁": (22.82, 108.32, "南宁"),
+    "柳州": (24.31, 109.41, "柳州"), "北京": (39.90, 116.41, "北京"),
+    "上海": (31.23, 121.47, "上海"), "广州": (23.13, 113.26, "广州"),
+    "深圳": (22.54, 114.06, "深圳"), "杭州": (30.27, 120.16, "杭州"),
+    "成都": (30.57, 104.07, "成都"), "重庆": (29.56, 106.55, "重庆"),
+    "武汉": (30.59, 114.31, "武汉"), "西安": (34.34, 108.94, "西安"),
+    "南京": (32.06, 118.80, "南京"), "天津": (39.13, 117.20, "天津"),
+    "长沙": (28.23, 112.94, "长沙"), "昆明": (25.04, 102.71, "昆明"),
+    "贵阳": (26.65, 106.63, "贵阳"), "海口": (20.04, 110.32, "海口"),
+    "郑州": (34.75, 113.62, "郑州"), "南昌": (28.68, 115.86, "南昌"),
+}
+
 # WMO 天气码 → 中文
 WEATHER_CODE = {
     0: "晴", 1: "晴间多云", 2: "多云", 3: "阴",
@@ -44,7 +58,7 @@ _cache: dict[str, tuple[float, str]] = {}
 CACHE_TTL = 600
 
 
-def _get_json(url: str, params: dict, timeout: int = 8) -> dict:
+def _get_json(url: str, params: dict, timeout: int = 6) -> dict:
     query = urllib.parse.urlencode(params)
     req = urllib.request.Request(
         f"{url}?{query}", headers={"User-Agent": "campus-agent/1.0"}
@@ -54,10 +68,12 @@ def _get_json(url: str, params: dict, timeout: int = 8) -> dict:
 
 
 def _geocode(city: str) -> tuple[float, float, str] | None:
-    """返回 (纬度, 经度, 规范城市名)。"""
+    """返回 (纬度, 经度, 规范城市名)。内置坐标优先，查不到再走网络。"""
+    if city in CITY_COORD:
+        return CITY_COORD[city]
     name = CITY_ALIAS.get(city, city)
     try:
-        data = _get_json(GEO_URL, {"name": name, "count": 5, "language": "zh"})
+        data = _get_json(GEO_URL, {"name": name, "count": 5, "language": "zh"}, timeout=5)
     except Exception:
         return None
 
