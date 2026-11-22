@@ -20,7 +20,20 @@
       color: #fff;
       font-size: 17px;
       font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
     }
+    #newChat {
+      background: rgba(255,255,255,.16);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,.45);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    #newChat:hover { background: rgba(255,255,255,.3); }
     header small { font-weight: 400; opacity: .8; margin-left: 8px; font-size: 13px; }
     #chat {
       flex: 1;
@@ -85,7 +98,7 @@
   </style>
 </head>
 <body>
-  <header>桂电校园助手<small>新生报到 · 入学 · 校园生活</small></header>
+  <header><span>桂电校园助手<small>新生报到 · 入学 · 校园生活</small></span><button id="newChat" type="button">新对话</button></header>
   <div id="chat"></div>
   <form id="form">
     <input id="q" placeholder="例如：什么时候报到？快递点在哪里？" autocomplete="off">
@@ -105,6 +118,13 @@
       sessionId = 'sess_' + Math.random().toString(36).slice(2, 10);
       localStorage.setItem('chat_sid', sessionId);
     }
+
+    // 新对话：丢掉旧 session_id，页面重开后会生成新的
+    document.getElementById('newChat').addEventListener('click', () => {
+      if (!confirm('开一个新对话？当前对话记录不会删除，只是不再接着聊。')) return;
+      localStorage.removeItem('chat_sid');
+      location.reload();
+    });
 
     function addBubble(text, role) {
       const div = document.createElement('div');
