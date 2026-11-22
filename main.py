@@ -141,11 +141,14 @@ def append_message(session_id: str, role: str, content: str) -> None:
             "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
             (session_id, role, content),
         )
-        conn.commit()
+        conn.commit()   #数据库完成后必须提交事务 否则数据只存在内存里
 
 
 def trim_history(session_id: str, keep: int = HISTORY_LIMIT) -> None:
-    """只保留最近 keep 条，避免数据库无限增长。"""
+    """只保留最近 keep 条，避免数据库无限增长。
+    括号里的子查询是：选出 session_id 对应的最新 keep 个 消息的id
+    外面删除的逻辑：把该用户除了这 keep 个消息以外的所有消息都删掉
+    """
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
             "DELETE FROM messages WHERE session_id=? AND id NOT IN "
@@ -702,8 +705,13 @@ async def chat_stream(request: ChatRequest):
                         args = json.loads(tool_call.function.arguments or "{}")
                     except json.JSONDecodeError:
                         args = {}
-                    tool_notes.append(f"- {name}({json.dumps(args, ensure_ascii=False)}) 返回：{call_tool(name, args)}")
-                messages[0]["content"] += "\n\n【工具结果】\n" + "\n".join(tool_notes)
+                    # 只放"结果本身"，不要放 get_weather({...}) 这种调用格式——
+                    # 模型会把它当成"我要复述的调用"照抄到答案里。
+                    tool_notes.append(str(call_tool(name, args)))
+                messages[0]["content"] += (
+                    "\n\n【已获取的实时数据】\n" + "\n".join(tool_notes)
+                    + "\n请直接根据以上数据回答用户，不要复述查询过程，不要输出函数名或参数。"
+                )
                 yield "data: [系统提示：已获取实时数据，正在生成回答...]\n\n"
             elif not context.strip() and not load_summary(request.session_id):
                 log.info("无资料且未调用工具，流式返回兜底 session=%s", request.session_id)
