@@ -711,7 +711,13 @@ async def chat(request: ChatRequest):
             # "桂林今天多云，气温10℃-20℃"（真实数据是单点值，不存在区间）。
             if not used_tool and wants_weather(query, request.session_id):
                 fb = try_answer_weather(query, force=True, session_id=request.session_id)
-                if fb is not None and not fb.startswith("你想查哪个城市"):
+                if fb is not None and fb.startswith("你想查哪个城市"):
+                    # 没城市也没上文：宁可反问，也不让模型挑一个默认城市（可能答错对象）
+                    log.info("天气问题缺城市且无上文，代码反问 session=%s", request.session_id)
+                    append_message(request.session_id, "user", query)
+                    append_message(request.session_id, "assistant", fb)
+                    return {"answer": fb}
+                if fb is not None:
                     log.info("模型未调工具，代码补调天气（非流式） session=%s", request.session_id)
                     messages[0]["content"] += (
                         "\n\n【已获取的实时数据】\n" + fb
@@ -785,8 +791,6 @@ async def chat_stream(request: ChatRequest):
         _ctx_city = None if _has_city else recent_city(request.session_id)
         fb0 = try_answer_weather(query, force=True, session_id=request.session_id) \
             if (not _has_city) else None
-        if fb0 is not None and fb0.startswith("你想查哪个城市"):
-            fb0 = None
         if fb0 is None and _ctx_city:
             fb0 = get_weather(_ctx_city)
         if fb0 is not None:
