@@ -714,15 +714,6 @@ async def chat_stream(request: ChatRequest):
 
     # 和 /chat 一样：不能因为知识库没资料就提前返回，否则工具永远调不到。
     # 兜底放在"模型决定不调工具"之后（见 generate 里的 elif）。
-    weather_ans = try_answer_weather(query)
-    if weather_ans is not None:
-        append_message(request.session_id, "user", query)
-        append_message(request.session_id, "assistant", weather_ans)
-
-        def stream_weather():
-            yield f"data: {weather_ans}\n\n"
-        return StreamingResponse(stream_weather(), media_type="text/event-stream")
-
     search_query = rewrite_query(query, request.session_id)
     context = get_school_context(search_query, fallback=query)
     messages = build_messages(request.session_id, query, context)
@@ -765,7 +756,24 @@ async def chat_stream(request: ChatRequest):
                     + "\n请直接根据以上数据回答用户，不要复述查询过程，不要输出函数名或参数。"
                 )
                 yield "data: [系统提示：正在查询实时信息...]\n\n"
-            elif not context.strip() and not load_summary(request.session_id):
+            else:
+                # 模型判断"不用调工具" → 代码校验：它是不是漏了一次该做的工具调用？
+                # 只对"有确定性数据源"的天气类做，且只补调一次。
+                fb = try_answer_weather(query)
+                if fb is not None and fb.startswith("你想查哪个城市"):
+                    # 生成器里不能 return 一个 StreamingResponse（那只是结束生成器，客户端收不到内容）
+                    append_message(request.session_id, "user", query)
+                    append_message(request.session_id, "assistant", fb)
+                    yield f"data: {fb}\n\n"
+                    return
+                if fb is not None:
+                    log.info("模型未调工具，代码补调天气 session=%s", request.session_id)
+                    messages[0]["content"] += (
+                        "\n\n【已获取的实时数据】\n" + fb
+                        + "\n请直接根据以上数据回答用户，不要复述查询过程。"
+                    )
+
+            if not response_message.tool_calls and not context.strip() and not load_summary(request.session_id) and try_answer_weather(query) is None:
                 log.info("无资料且未调用工具，流式返回兜底 session=%s", request.session_id)
                 yield f"data: {NO_DATA_ANSWER}\n\n"
                 return
