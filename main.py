@@ -700,7 +700,7 @@ async def chat(request: ChatRequest):
 
     for attempt in range(max_retries):
         try:
-            answer, used_tool, rounds = run_agent(messages, trace=trace)     #这个message就是model——message
+            answer, used_tool, rounds = run_agent(messages, trace=trace)     #这个messages就是model——message
             log.info(
                 "agent 完成 rounds=%d used_tool=%s session=%s",
                 rounds, used_tool, request.session_id,
@@ -829,6 +829,13 @@ async def chat_stream(request: ChatRequest):
                 # 意图是天气、却没调 get_weather → 补一次，别让它拿别的工具结果编天气。
                 if wants_weather(query, request.session_id) and "get_weather" not in called_tools:
                     fb2 = try_answer_weather(query, force=True, session_id=request.session_id)
+                    if fb2 is not None and fb2.startswith("你想查哪个城市"):
+                        # 这句是"追问"，不是数据。以前把它当数据塞进【已获取的实时数据】，
+                        # 模型就会照着编（实测答出"桂林今天多云，气温10℃-20℃"）。
+                        append_message(request.session_id, "user", query)
+                        append_message(request.session_id, "assistant", fb2)
+                        yield f"data: {fb2}\n\n"
+                        return
                     if fb2 is not None:
                         log.info("模型调错工具，代码补调天气 session=%s", request.session_id)
                         tool_notes.append(str(fb2))
