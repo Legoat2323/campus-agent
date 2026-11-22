@@ -706,6 +706,19 @@ async def chat(request: ChatRequest):
                 rounds, used_tool, request.session_id,
             )
 
+            # 模型判断"不用调工具"→代码校验：天气类问题它是不是漏了一次该做的调用？
+            # 非流式路径原来没有这一层，实测"今天天气怎么样呀"会被模型凭常识编成
+            # "桂林今天多云，气温10℃-20℃"（真实数据是单点值，不存在区间）。
+            if not used_tool and wants_weather(query, request.session_id):
+                fb = try_answer_weather(query, force=True, session_id=request.session_id)
+                if fb is not None and not fb.startswith("你想查哪个城市"):
+                    log.info("模型未调工具，代码补调天气（非流式） session=%s", request.session_id)
+                    messages[0]["content"] += (
+                        "\n\n【已获取的实时数据】\n" + fb
+                        + "\n请直接根据以上数据回答用户，不要复述查询过程。"
+                    )
+                    answer, used_tool, rounds = run_agent(messages, trace=trace)
+
             if answer is None:
                 # 到轮数上限还没收口：当作答不出来，别再让它继续调
                 log.warning("agent 达到轮数上限 session=%s", request.session_id)
