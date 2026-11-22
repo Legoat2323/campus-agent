@@ -404,14 +404,37 @@ MAX_TOOL_ROUNDS = 3
 _WEATHER_RE = re.compile(r"天气|气温|温度|下雨|下雪|冷不冷|热不热")
 
 
-def try_answer_weather(query: str) -> str | None:
-    """命中天气问题就返回答案（或固定失败话术）；不是天气问题返回 None。"""
-    if not _WEATHER_RE.search(query):
+def try_answer_weather(query: str, force: bool = False) -> str | None:
+    """命中天气问题就返回答案（或固定失败话术）；不是天气问题返回 None。
+
+    force=True 用于"上下文已判定是天气追问"的场景（用户只回了一个城市名，
+    句子里没有"天气"两个字，但意图明确）。
+    """
+    if not force and not _WEATHER_RE.search(query):
         return None
     city = next((c for c in CITY_COORD if c in query), None)
     if city is None:
         return "你想查哪个城市的天气？告诉我城市名就行。"
     return get_weather(city)          # 失败时它自己返回"天气服务暂时连不上…"
+
+
+def wants_weather(query: str, session_id: str) -> bool:
+    """判断"这一轮到底是不是在问天气"——不能只看当前句子。
+
+    反例：上一轮助手问"你想查哪个城市的天气？"，用户只回"桂林"，
+    当前句子里没有"天气"两个字，但意图明显是天气。
+    """
+    if _WEATHER_RE.search(query):
+        return True
+    city = next((c for c in CITY_COORD if c in query), None)
+    if city is None:
+        return False
+    # 这一轮只有一个城市名（如"桂林"）：看上一轮助手是不是在聊天气
+    for _id, role, content in reversed(load_all_messages(session_id)[-4:]):
+        c = content or ""
+        if role == "assistant" and ("℃" in c or "天气" in c):
+            return True
+    return False
 
 
 # ---- 工具调用缓存：同一工具 + 同样参数，TTL 内直接复用，避免重复外部请求 ----
@@ -714,6 +737,17 @@ async def chat_stream(request: ChatRequest):
 
     # 和 /chat 一样：不能因为知识库没资料就提前返回，否则工具永远调不到。
     # 兜底放在"模型决定不调工具"之后（见 generate 里的 elif）。
+    # 纯城市名追问（上一轮在聊天气，这一轮只回"桂林"）：意图唯一，直接查，不劳模型。
+    # 实测这种句子交给模型时，它有时调了工具却仍回"没有相关资料"。
+    if wants_weather(query, request.session_id) and not _WEATHER_RE.search(query):
+        fb0 = try_answer_weather(query, force=True)
+        if fb0 is not None:
+            append_message(request.session_id, "user", query)
+            append_message(request.session_id, "assistant", fb0)
+            def stream_city_only():
+                yield f"data: {fb0}\n\n"
+            return StreamingResponse(stream_city_only(), media_type="text/event-stream")
+
     search_query = rewrite_query(query, request.session_id)
     context = get_school_context(search_query, fallback=query)
     messages = build_messages(request.session_id, query, context)
@@ -742,6 +776,7 @@ async def chat_stream(request: ChatRequest):
                 # 把工具结果写进 system，而不是伪造一条 assistant 消息。
                 # 原因：messages 若以 assistant 结尾，模型会认为"轮到用户说了"，直接返回空。
                 tool_notes = []
+                called_tools: set[str] = set()
                 for tool_call in response_message.tool_calls:
                     name = tool_call.function.name
                     try:
@@ -751,6 +786,15 @@ async def chat_stream(request: ChatRequest):
                     # 只放"结果本身"，不要放 get_weather({...}) 这种调用格式——
                     # 模型会把它当成"我要复述的调用"照抄到答案里。
                     tool_notes.append(str(call_tool(name, args)))
+                    called_tools.add(name)
+
+                # 模型调了工具，但可能调的不是该调的那个（实测：问天气它去调 get_current_time）。
+                # 意图是天气、却没调 get_weather → 补一次，别让它拿别的工具结果编天气。
+                if wants_weather(query, request.session_id) and "get_weather" not in called_tools:
+                    fb2 = try_answer_weather(query, force=True)
+                    if fb2 is not None:
+                        log.info("模型调错工具，代码补调天气 session=%s", request.session_id)
+                        tool_notes.append(str(fb2))
                 messages[0]["content"] += (
                     "\n\n【已获取的实时数据】\n" + "\n".join(tool_notes)
                     + "\n请直接根据以上数据回答用户，不要复述查询过程，不要输出函数名或参数。"
@@ -759,7 +803,7 @@ async def chat_stream(request: ChatRequest):
             else:
                 # 模型判断"不用调工具" → 代码校验：它是不是漏了一次该做的工具调用？
                 # 只对"有确定性数据源"的天气类做，且只补调一次。
-                fb = try_answer_weather(query)
+                fb = try_answer_weather(query, force=True) if wants_weather(query, request.session_id) else None
                 if fb is not None and fb.startswith("你想查哪个城市"):
                     # 生成器里不能 return 一个 StreamingResponse（那只是结束生成器，客户端收不到内容）
                     append_message(request.session_id, "user", query)
@@ -773,7 +817,7 @@ async def chat_stream(request: ChatRequest):
                         + "\n请直接根据以上数据回答用户，不要复述查询过程。"
                     )
 
-            if not response_message.tool_calls and not context.strip() and not load_summary(request.session_id) and try_answer_weather(query) is None:
+            if not response_message.tool_calls and not context.strip() and not load_summary(request.session_id) and not wants_weather(query, request.session_id):
                 log.info("无资料且未调用工具，流式返回兜底 session=%s", request.session_id)
                 yield f"data: {NO_DATA_ANSWER}\n\n"
                 return
