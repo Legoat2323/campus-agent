@@ -401,7 +401,9 @@ MAX_TOOL_ROUNDS = 3
 # ---- 天气类问题：代码直接答，不交给模型判断"要不要调工具" ----
 # 理由：模型有时不调工具、直接凭常识编天气（实测出现过"10℃到20℃之间"这种不存在的区间）。
 # 天气有确定性数据源，用代码兜住，模型只负责转述 → 从根上不可能编。
-_WEATHER_RE = re.compile(r"天气|气温|温度|下雨|下雪|冷不冷|热不热")
+_WEATHER_RE = re.compile(
+    r"天气|气温|温度|下雨|下雪|冷不冷|热不热|带伞|雨伞|晒不晒|防晒|紫外线|潮不潮|闷不闷"
+)
 
 
 def try_answer_weather(query: str, force: bool = False) -> str | None:
@@ -462,7 +464,10 @@ def call_tool(name: str, args: dict, trace: list | None = None) -> str:
         log.warning("工具执行失败 tool=%s err=%s", name, e)
         return f"工具执行失败：{e}"
 
-    _TOOL_CACHE[key] = (now, content)
+    # 只缓存"成功结果"。失败话术（如"天气服务暂时连不上"）一旦被缓存，
+    # 接下来 5 分钟每次都会返回同一条失败文案——实测踩过这个坑。
+    if not content.startswith("天气服务暂时连不上"):
+        _TOOL_CACHE[key] = (now, content)
     return content
 
 
