@@ -6,6 +6,7 @@
 3. print 换成 logging —— 能落盘、能分级、带时间戳
 """
 import json
+import re
 import logging
 import os
 import sqlite3
@@ -20,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from openai import OpenAI, RateLimitError
 from pydantic import BaseModel
 
-from weather import get_weather
+from weather import CITY_COORD, get_weather
 from tools import TOOL_SCHEMAS as tools, TOOL_IMPL
 from langchain_community.vectorstores import Chroma  #这是langchain的向量数据库
 from langchain_openai import OpenAIEmbeddings
@@ -397,6 +398,22 @@ def get_school_context(question: str, fallback: str | None = None) -> str:
 MAX_TOOL_ROUNDS = 3
 
 
+# ---- 天气类问题：代码直接答，不交给模型判断"要不要调工具" ----
+# 理由：模型有时不调工具、直接凭常识编天气（实测出现过"10℃到20℃之间"这种不存在的区间）。
+# 天气有确定性数据源，用代码兜住，模型只负责转述 → 从根上不可能编。
+_WEATHER_RE = re.compile(r"天气|气温|温度|下雨|下雪|冷不冷|热不热")
+
+
+def try_answer_weather(query: str) -> str | None:
+    """命中天气问题就返回答案（或固定失败话术）；不是天气问题返回 None。"""
+    if not _WEATHER_RE.search(query):
+        return None
+    city = next((c for c in CITY_COORD if c in query), None)
+    if city is None:
+        return "你想查哪个城市的天气？告诉我城市名就行。"
+    return get_weather(city)          # 失败时它自己返回"天气服务暂时连不上…"
+
+
 # ---- 工具调用缓存：同一工具 + 同样参数，TTL 内直接复用，避免重复外部请求 ----
 _TOOL_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
 _TOOL_CACHE_TTL = 300          # 秒；天气这类时效性数据 5 分钟足够
@@ -697,6 +714,15 @@ async def chat_stream(request: ChatRequest):
 
     # 和 /chat 一样：不能因为知识库没资料就提前返回，否则工具永远调不到。
     # 兜底放在"模型决定不调工具"之后（见 generate 里的 elif）。
+    weather_ans = try_answer_weather(query)
+    if weather_ans is not None:
+        append_message(request.session_id, "user", query)
+        append_message(request.session_id, "assistant", weather_ans)
+
+        def stream_weather():
+            yield f"data: {weather_ans}\n\n"
+        return StreamingResponse(stream_weather(), media_type="text/event-stream")
+
     search_query = rewrite_query(query, request.session_id)
     context = get_school_context(search_query, fallback=query)
     messages = build_messages(request.session_id, query, context)
